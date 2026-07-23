@@ -43,6 +43,7 @@ htmlcov/
 
 # Dev scripts & probes (learning material, keep separate from core)
 misc/
+traces/
 
 # Local environment
 .env

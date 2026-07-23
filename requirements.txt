@@ -4,3 +4,13 @@ mercapi>=0.4.2
 
 # HTTP layer, used directly only to classify transport errors.
 httpx>=0.27
+
+# Official Anthropic SDK. Tool calling is used directly; no agent
+# framework sits on top of it.
+anthropic>=0.40
+
+# Terminal rendering for the recommendation output.
+rich>=13.7
+
+# Loads ANTHROPIC_API_KEY from a local .env during development.
+python-dotenv>=1.0
