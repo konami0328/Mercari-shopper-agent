@@ -1,0 +1,6 @@
+# Mercari access. Handles the request signing the site requires, so the
+# agent does not reimplement it.
+mercapi>=0.4.2
+
+# HTTP layer, used directly only to classify transport errors.
+httpx>=0.27
