@@ -46,6 +46,7 @@ DEFAULT_BASE_URL = os.getenv("ANTHROPIC_BASE_URL") or None
 # Upper bound on a single completion. The final answer is a tool call with
 # three short reasons, so this is generous.
 DEFAULT_MAX_TOKENS = 2048
+DEFAULT_TEMPERATURE = 0.0
 
 
 @dataclasses.dataclass(frozen=True)

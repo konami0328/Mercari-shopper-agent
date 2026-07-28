@@ -16,6 +16,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
+from rich.console import Console, Group
+from rich.padding import Padding
 from typing import Any
 
 # Redundant when the entry point is `python -m shopper` — shopper's
@@ -73,9 +75,13 @@ def _render_recommendation(outcome: Recommendation) -> None:
         listing = listing_of(entry)
         if listing is None:
             continue
+
         table = Table(show_header=False, box=None, padding=(0, 1))
-        table.add_column(style="dim", width=10)
-        table.add_column()
+        table.add_column(style="dim", width=10, no_wrap=True)
+        # overflow="fold" is the fix. Rich's default is "ellipsis", which
+        # silently truncates anything wider than the measured column —
+        # including the reason, which is the point of the whole run.
+        table.add_column(overflow="fold")
         table.add_row("Price", f"[bold]¥{listing.price:,}[/bold]")
         table.add_row("Condition", listing.condition)
         seller = getattr(listing, "seller", None)
@@ -85,12 +91,18 @@ def _render_recommendation(outcome: Recommendation) -> None:
                 f"score {seller.score} "
                 f"({seller.num_good} good / {seller.num_bad} bad)",
             )
-            table.add_row("Shipping", f"paid by {listing.shipping_payer}")
+            # The value already reads "送料込み(出品者負担)"; prefixing it
+            # with "paid by" says the same thing twice.
+            table.add_row("Shipping", listing.shipping_payer)
         table.add_row("Link", f"[link={listing.url}]{listing.url}[/link]")
-        table.add_row("Why", Markdown(entry["reason"]))
+
+        # The reason gets the full panel width, below the facts.
+        body = Group(table, Padding(Markdown(entry["reason"]), (1, 1, 0, 1)))
+
         console.print(Panel(
-            table,
+            body,
             title=f"[bold]{rank}. {listing.name}[/bold]",
+            title_align="left",
             border_style="blue",
         ))
 
@@ -176,7 +188,7 @@ def main(argv: list[str] | None = None) -> int:
 
     console.print(Panel(
         Text("Ask for anything on Mercari Japan. "
-             "Japanese, English or Chinese. Type 'exit' to leave."),
+             "Japanese or English. Type 'exit' to leave."),
         title="Mercari shopper",
         border_style="green",
     ))

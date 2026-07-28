@@ -64,7 +64,7 @@ def build_tool_schemas(budget: RunBudget) -> list[dict[str, Any]]:
                 "id, title, price in JPY, and condition.\n\n"
                 "Keyword guidance: Mercari's index is Japanese. Translate "
                 "the user's intent into Japanese search terms even when "
-                "they wrote in English or Chinese. Sellers stuff titles "
+                "they wrote in English. Sellers stuff titles "
                 "with keywords, so two or three well-chosen terms retrieve "
                 "better than one long phrase.\n\n"
                 "Important: this endpoint almost never returns zero "

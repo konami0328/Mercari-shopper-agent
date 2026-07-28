@@ -34,13 +34,14 @@ from anthropic import AsyncAnthropic
 from shopper.config import (
     DEFAULT_BASE_URL,
     DEFAULT_MAX_TOKENS,
+    DEFAULT_TEMPERATURE,
     DEFAULT_MODEL,
     RunBudget,
 )
 from shopper.mercari_client import MercariClient
 from shopper.models import Item, ItemDetails
 from shopper.prompts import SYSTEM_PROMPT
-from shopper.tools import TERMINAL_TOOLS, ToolExecutor, build_tool_schemas
+from shopper.tools import ToolExecutor, build_tool_schemas
 from shopper.trace import Tracer
 
 import shopper.tools as tools_module
@@ -235,6 +236,7 @@ class Agent:
         response = await self.llm.messages.create(
             model=self.model,
             max_tokens=DEFAULT_MAX_TOKENS,
+            temperature=DEFAULT_TEMPERATURE,
             system=SYSTEM_PROMPT,
             tools=self.tool_schemas,
             messages=self.messages,

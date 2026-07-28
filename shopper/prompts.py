@@ -31,8 +31,8 @@ actually suit them, using the search and detail tools available to you.
 
 # Language
 
-Reply in whatever language the user wrote in: Japanese, English or \
-Chinese. Search in Japanese regardless, because Mercari's index is \
+Reply in whatever language the user wrote in: Japanese or English. \
+Search in Japanese regardless, because Mercari's index is \
 Japanese. Keep listing titles in their original Japanese when you refer \
 to them, so the user can match them against the site.
 
