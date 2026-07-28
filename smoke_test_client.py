@@ -12,7 +12,7 @@ it checks is loop mechanics, not answer quality:
     in the history has exactly one matching tool_result
 
 Usage:
-    python smoke_test_agent.py
+    python smoke_test_client.py
 """
 
 from __future__ import annotations

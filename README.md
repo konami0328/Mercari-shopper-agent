@@ -9,35 +9,37 @@ and returns up to three ranked listings with a concrete reason for each one.
 
 ## Overview
 
-One request moves through six stages. They alternate between the model and
-ordinary code, and the same six numbers are used everywhere below — in the
-worked example, the diagram, the message trace, and the failure table.
+One request moves through six stages, alternating between the model and
+ordinary code. These stage numbers are used throughout — in the diagram
+below, and again in the evaluation table at the end.
 
-| # | Stage | Who | Tool |
-|---|---|---|---|
-| 1 | **Interpret** — request → search parameters | model | `search_mercari` |
-| 2 | **Retrieve** — parameters → listings | code | — |
-| 3 | **Assess** — are these results actually relevant? | model | — |
-| 4 | **Enrich** — shortlist → descriptions, seller stats | code | `get_item_details` |
-| 5 | **Rank and justify** — details → three ranked reasons | model | `present_recommendations` |
-| 6 | **Validate and render** — check, join, display | code | — |
+| # | Stage | Who |
+|---|---|---|
+| 1 | **Interpret** — request → search parameters | model |
+| 2 | **Retrieve** — parameters → listings | code |
+| 3 | **Assess** — are these results actually relevant? | model |
+| 4 | **Enrich** — shortlist → descriptions, seller stats | code |
+| 5 | **Rank and justify** — details → three ranked reasons | model |
+| 6 | **Validate and render** — check, join, display | code |
 
-Stages 1, 3 and 5 are the model. Stages 2, 4 and 6 are deterministic
-functions. That split holds throughout: **all judgement lives in the model;
-everything else is a deterministic function.** `MercariClient` never sees the
-user's sentence, and never decides whether a listing is a good match.
+**All judgement lives in the model; everything else is a deterministic
+function.** `MercariClient` never sees the user's sentence and never decides
+whether a listing is a good match. No agent framework is used — the loop is a
+single function in `agent.py`, and both it and the reasoning behind the split
+are in [Design Choices](#design-choices).
 
-`ask_clarification` is the fourth tool and sits outside the spine — it is an
-exit from stage 1 for requests that cannot be searched at all.
-
-### The pipeline
+The model acts through four tools. Three form the spine: `search_mercari`
+at stage 1, `get_item_details` at stage 4, and `present_recommendations`,
+which delivers the answer and ends the turn at stage 5. The fourth,
+`ask_clarification`, sits outside it — an exit from stage 1 for requests
+that cannot be searched at all.
 
 ```mermaid
 flowchart TD
     U(["User request<br/>Japanese or English"])
 
     S1["<b>1 · Interpret</b> — model<br/>emits search_mercari with<br/>keyword, price_min, price_max,<br/>condition_at_least, sort"]
-    S2["<b>2 · Retrieve</b> — code<br/>query Mercari, normalise<br/>→ up to 30 × id, title, price, condition"]
+    S2["<b>2 · Retrieve</b> — code<br/>query Mercari, normalise<br/>→ up to 30 listings, 6 fields each"]
     S3["<b>3 · Assess</b> — model<br/>label every result relevant<br/>or not, then count"]
     S4["<b>4 · Enrich</b> — code<br/>get_item_details, max 5 ids<br/>→ description, seller rating, shipping"]
     S5["<b>5 · Rank and justify</b> — model<br/>emits present_recommendations:<br/>max 3 items + a reason each,<br/>confidence, notes"]
@@ -57,96 +59,13 @@ flowchart TD
     S6 -.->|"invented id — one repair attempt"| S5
 ```
 
-The dotted edges are the interesting ones. They are the paths that exist
-because the agent is allowed to fail honestly rather than always produce three
-listings.
-
-### The same request, concretely
-
-```
-User: 美品のギターを30000円以下で探しています
-      ("a guitar in great condition, under ¥30,000")
-
- 1  Interpret
-      search_mercari { keyword:            "ギター アコースティック",
-                       price_max:          30000,
-                       condition_at_least: "like_new" }
-
- 2  Retrieve
-      Each raw hit is trimmed from ~20 fields to the 6 that can change a
-      ranking decision. 30 listings go back to the model.
-
- 3  Assess
-      The model labels each result relevant or not and counts them. Nine
-      are relevant, so it proceeds instead of re-searching.
-
- 4  Enrich
-      get_item_details on four shortlisted ids → seller descriptions,
-      ratings, shipping terms.
-
- 5  Rank and justify
-      present_recommendations with three listings, a reason citing
-      something concrete about each, confidence "medium", and the
-      assumptions it made in notes.
-
- 6  Validate and render
-      The id → listing join happens locally, against the listings we
-      actually retrieved. An id the model invented is caught here and
-      never reaches the user.
-```
-
-### The loop, and what accumulates in it
-
-```
-messages = [user turn]
-repeat:
-    response = LLM(system_prompt, tool_schemas, messages)
-    append the assistant turn verbatim
-    for each tool_use block: execute it, collect a tool_result
-    append all tool_results as one user message
-    stop when a terminal tool succeeds, or the model stops calling tools
-```
-
-Every stage leaves a message behind, and the history is what carries state
-from one stage to the next — there is no separate state object. After a clean
-run the list looks like this:
-
-```
-  user       "美品のギターを30000円以下で"
-  assistant  [ text, tool_use search_mercari ]            ← stage 1
-  user       [ tool_result: 30 listings, 3 searches left ]← stage 2
-  assistant  [ text, tool_use get_item_details ]          ← stages 3, 4
-  user       [ tool_result: 4 details, 0 failures ]
-  assistant  [ tool_use present_recommendations ]         ← stage 5
-  user       [ tool_result: delivered ]
-```
-
-Note that stage 3 leaves no tool call of its own. It happens in the assistant
-turn between retrieving and enriching, which is exactly why the system prompt
-has to force it to produce evidence — see
-[Stage 3: Assess](#stage-3-assess).
-
-Three things about this loop are easy to get wrong; see
-[The message history is the state](#3-the-message-history-is-the-state).
-
-### Where each stage can fail
-
-The stage numbering is also the debugging index. Every run appends typed
-events to `traces/YYYY-MM-DD.jsonl`, keyed by run id, so a bad answer can be
-attributed to a stage rather than guessed at.
-
-| # | What goes wrong | Where it shows up |
-|---|---|---|
-| 1 | keyword misses the market's vocabulary; a stated budget is dropped; a condition is invented | the `search_mercari` arguments in the trace, against the original request |
-| 2 | transport failure, rate limiting | typed errors — `NetworkError`, `RateLimitError` — rather than one undifferentiated pile |
-| 3 | irrelevant fallback results accepted as genuine matches | search count and final `confidence`; **the failure mode this system is built around** |
-| 4 | a listing sells between search and detail fetch | per-id entries in the tool result's `errors` — expected, not exceptional |
-| 5 | padding to three, generic reasons, an invented id | `unknown_ids` and price-bound warnings emitted at validation |
-| 6 | — | deterministic; this stage is the net, not a source of error |
-
-Stages 1 and 5 are also the two natural units for offline evaluation: stage 1
-has a checkable answer for price and condition, and stage 5 can be checked
-against the structured records the recommendation claims to describe.
+Two things the diagram is making a point of. The dotted edges are the paths
+that exist because the agent is allowed to fail honestly rather than always
+produce three listings. And stage 3 has no tool call of its own — it happens
+in the model's own text, between a search result arriving and the next call
+being made, which is why the system prompt has to force it to produce
+evidence. See
+[Design Choices › It can tell you it found nothing](#it-can-tell-you-it-found-nothing).
 
 ---
 
@@ -155,14 +74,21 @@ against the structured records the recommendation claims to describe.
 Requires Python 3.10 or later.
 
 ```bash
-git clone https://github.com/konami0328/Mercari-shopper-agent.git
-cd Mercari-shopper-agent
+cd mercari-shopper-agent           # the unzipped directory
 
 python -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
 
 pip install -r requirements.txt
 ```
+
+| Package | Why it is here |
+|---|---|
+| `mercapi` | Mercari access. Handles the request signing the site requires. |
+| `httpx` | Used directly only to classify transport errors into our taxonomy. |
+| `anthropic` | Official SDK. Tool calling is used directly, with no framework on top. |
+| `rich` | Terminal rendering. |
+| `python-dotenv` | Loads `.env` during development. |
 
 Create a `.env` file in the project root:
 
@@ -171,10 +97,11 @@ ANTHROPIC_API_KEY=sk-ant-...
 ANTHROPIC_MODEL=claude-sonnet-4-5
 ```
 
-`ANTHROPIC_MODEL` is required and has no default. A hardcoded fallback would
-fail as a runtime 404 on the first request, three modules from the mistake.
+`ANTHROPIC_MODEL` is required and has no default on purpose: a hardcoded
+fallback that happens not to exist on the caller's key surfaces as a runtime
+404 on the first request, three modules from the mistake.
 
-Verify the install without spending an API call — the smoke test replaces both
+Verify the install without spending an API call. The smoke test replaces both
 the model and the data layer with scripted fakes, so it needs no key and no
 network:
 
@@ -182,13 +109,10 @@ network:
 python smoke_test_client.py
 ```
 
-| Package | Why it is here |
-|---|---|
-| `mercapi` | Mercari access. Handles the request signing the site requires. |
-| `httpx` | Used directly only to classify transport errors into our taxonomy. |
-| `anthropic` | Official SDK. Tool calling is used directly. |
-| `rich` | Terminal rendering. |
-| `python-dotenv` | Loads `.env` during development. |
+It checks loop mechanics rather than answer quality: that budgets bind when
+the model ignores them, that an invented listing id is rejected and repaired,
+that a partial detail failure does not sink the run, and that every
+`tool_use` block ends up with a matching `tool_result`.
 
 ---
 
@@ -220,252 +144,276 @@ python -m shopper "Looking for a mechanical keyboard under 10000 yen"
 
 ![Three recommendations for a guitar in good condition under 30,000 yen](demo_screenshot.jpg)
 
-> The screenshot above was produced against a DeepSeek endpoint via
-> `ANTHROPIC_BASE_URL`, using the same Anthropic SDK and tool-calling code
-> path shown here.
+> **A note on the model.** The screenshot was produced against DeepSeek's
+> model (DeepSeek v4 Pro), not Claude (due to region restriction) — reached by pointing
+> `ANTHROPIC_BASE_URL` at DeepSeek's Anthropic-compatible endpoint and
+> setting `ANTHROPIC_MODEL` to their model id. Everything else in the code
+> path is unchanged: the official `anthropic` SDK, the Anthropic Messages
+> API wire format, and the same tool-use logic documented here. There is
+> no provider abstraction layer in this codebase — swapping the model is
+> a one-line `.env` change; `config.py` is where that decision is
+> recorded.
 
-### Reproducible runs
-
-Mercari's inventory changes constantly, so two runs of the same query on
-different days differ for reasons that have nothing to do with the agent.
-`--mode record` saves every response to disk; `--mode replay` serves only from
-those files and raises `FixtureMissingError` on a call that was never
-recorded, because a run that is half online and half offline is not a
-reproducible run.
-
-This freezes stage 2, not stage 1: the same sentence can produce slightly
-different search parameters between runs, which changes the cache key and
-misses. Run at `temperature=0` to keep that drift down.
+`--mode replay` needs saved responses (cassettes) recorded ahead of time,
+and none are bundled with this submission. To try it, run a query once
+under `--mode record` first. See
+[Design Choices › Runs can be reproduced](#runs-can-be-reproduced-and-attributed-to-a-stage)
+for what that mode is for.
 
 ---
 
 ## Design Choices
 
-### Three system-wide decisions
+Each section is a capability, followed by the decisions that buy it.
+Assumptions that have not been measured are marked as such.
 
-#### 1. The model judges, the code does not
+### It can tell you it found nothing
 
-Stages 1, 3 and 5 are the model. Stages 2, 4 and 6 are plain functions with no
-model in them. `MercariClient` never sees the user's sentence and never
-decides whether a listing is a good match. Given the same arguments it returns
-the same thing every time.
+Mercari's search matches *some* of the query terms, not all of them. Adding
+constraints does not narrow the result set to listings that satisfy them all.
+`mercari_probe.py` measures this across four query classes — run it with
+`python mercari_probe.py`. Measured 2026-07-28; the inventory is live, so a
+re-run will not reproduce the counts exactly.
 
-This is what makes the system debuggable. Anything that changes between two
-runs of the same query is the model; anything that does not is code. When an
-answer is wrong, that line tells you which half to look at.
+![Weird query](demo_screenshot2.jpg)
 
-#### 2. The final answer is a tool call that does nothing
+| Class | Query shape | Non-empty | Counts |
+|---|---|---|---|
+| A | garbage ascii, tokenises to nothing | 0/3 | 0, 0, 0 |
+| B | real words, impossible combination | 3/3 | 30, 16, 2 |
+| C | multi-constraint, real product | 3/4 | 30, 0, 23, 16 |
+| D | ordinary query (control) | 3/3 | 30, 30, 30 |
 
-`present_recommendations` and `ask_clarification` have no side effects. They
-exist so the model's last act is a structured object instead of a paragraph.
+Two findings shape everything else:
 
-The model returns only listing ids and reasons. Everything shown to the user —
-price, condition, seller rating, link — is looked up locally from the listings
-we retrieved. So an id the model made up is simply an id that is not in that
-set, and it gets caught before the user sees it. Checking "did it recommend
-something it never retrieved" is one line of Python instead of reading prose.
+**Result count carries no information about relevance.** `宇宙船 デニム`
+("spaceship denim") filled a full page of 30, one term matching a
+space-print T-shirt and the other a pair of jeans. `ローランド SH-101 ブルー
+完動品 元箱付き` — a real product, plainly described — returned zero.
 
-It also means `confidence` and `notes` are required fields rather than
-something the model might forget to mention.
+**Partial matches are indistinguishable from good ones.** `エルメス バーキン
+25 ヒマラヤ 新品未使用` returned an Hermès *bracelet* at ¥420,800: right
+brand, right colourway, wrong product category. `ライカ M3 ダブルストローク
+1954年 前期型` returned M3 bodies with the wrong shutter mechanism and the
+wrong year. `リーバイス 501 1947年 デッドストック` returned a 501XX
+reproduction. Every field is well-formed; nothing marks any of them as
+satisfying only part of the request.
 
-#### 3. The message history is the state
+Two consequences:
 
-There is no separate state object. Each stage leaves a message behind and the
-next stage reads it. That keeps the loop short, but three things about it
-break in ways that are hard to trace back:
+- The planned "empty result → loosen constraints → retry" mechanism does not
+  hold as a general trigger. Empty sets do occur (class A), but the more
+  common failure is a full page of partial matches that a count alone cannot
+  distinguish from a good result.
+- Relevance judgement moves entirely into the model, as a step with no tool
+  of its own. Only the system prompt can enforce it.
 
-- The assistant turn goes into the history exactly as it came back, text
-  blocks included. Stage 3 happens in those text blocks, so filtering them out
-  throws away the reasoning.
-- One assistant turn can hold several `tool_use` blocks. Each one needs a
-  `tool_result`, and all of them go into a single user message.
-- This applies to the closing tools too. A `tool_use` with no matching
-  `tool_result` makes the API reject the history on the *next* turn. It shows
-  up as a 400 the first time someone asks a second question, far from the code
-  that caused it. So a closing call that arrives alongside a search call is
-  still executed and answered before the loop returns.
+The prompt targets four specific weaknesses:
 
-### Stage by stage
+| Weakness | Countermeasure |
+|---|---|
+| The evidence is not in the data | Label each result relevant or not, then count. Mechanical, not a holistic judgement |
+| No prior for normal result density | Threshold supplied: fewer than 5 relevant means the search failed. Re-query with different keywords. This also covers the empty case — zero results is zero relevant |
+| Admitting failure contradicts its own earlier work | Prompt states that returning fewer than 3 listings, or none, is correct; padding is a failure |
+| A wrong global judgement is invisible to the user | `confidence` is a required field |
 
-#### Stage 1: Interpret
+The prompt's trap list — reproductions sold as originals (復刻, レプリカ,
+LVC), bundles when one item was wanted (まとめ売り), accessories or parts
+when the main product was wanted, wrong sizes or models — predates this
+measurement; it came from probing during earlier data-layer work. The probe
+corroborates two of those categories directly (the 501XX reproduction, the
+Leica's wrong shutter mechanism and year) but does not cleanly fit a third:
+the Hermès bracelet matches on brand and colourway while missing product
+category entirely, a failure shape the current trap list does not name.
 
-**Some things are kept away from the model on purpose.** It cannot set the
-result `limit`, which is our context budget rather than a user need, or the
-sale `status`, since we never show sold items. It also gets no "filter" or
-"rank" tool, because filtering and ranking are the reasoning being tested.
-Handing it a ranking tool would move the interesting part into our code.
+`ask_clarification` is capped at once per conversation and reserved for
+requests that cannot be searched at all — no identifiable product, or a
+category spanning orders of magnitude with no budget. Otherwise: assume,
+search, record the assumption in `notes`.
 
-**`condition_at_least` is a threshold, not a set.** Mercari's API wants a set
-of accepted condition ids. Users think in thresholds: "at least in decent
-shape". The tool takes one boundary and expands it. That removes a whole class
-of mistakes where the model picks the right worst case but forgets to include
-everything above it.
+**Unvalidated.** The threshold of 5 is a guess, as is the ranking priority
+(condition > seller rating > seller-paid shipping). The retrieval behaviour
+above is measured; these two are not, and neither has been tuned against a
+result. See [Potential Improvements](#potential-improvements).
 
-**The `sort` parameter carries a warning in its own description.** Sorting by
-price ascending on Mercari brings up cheap accessories and junk, not cheap
-examples of the thing you asked for. So the description says so, and tells the
-model to keep the default sort and set `price_max` instead. Found by probing,
-written where the model will actually read it.
+### The final answer is a structured object, not prose
 
-**The bar for asking a question is set high.** `ask_clarification` is allowed
-once per conversation, and only when searching would be pure guesswork: no
-identifiable product, or a category spanning orders of magnitude with no
-budget given. Otherwise the model assumes something reasonable, searches, and
-writes the assumption into `notes`. A shopping assistant that opens with three
-questions is worse than one that makes a sensible guess and says what it
-guessed.
+`present_recommendations` and `ask_clarification` execute and do nothing. They
+have no side effects. Their only purpose is to make the model's last act a
+schema-shaped object.
 
-#### Stage 2: Retrieve
+The model returns listing ids and reasons. Price, condition, seller rating and
+link are joined locally from the listings retrieved during the run. That gives:
 
-**An unofficial API client instead of HTML scraping.** Mercari does not
-publish a product API for outside developers. `mercapi` is a community client
-for the private API that Mercari's own app calls, and it handles the request
-signing that needs. It returns structured JSON, so there are no page selectors
-to break when the markup changes and no browser to run.
+- **Invented ids are mechanically detectable** — an id not in the retrieved
+  set. One line of Python, no prose parsing.
+- **Rank is the array order.** The model orders `items` best-first; no code
+  reorders. The criteria sit in the system prompt as prose, not as weights in
+  a scoring function.
+- **`confidence` and `notes` are required fields**, so uncertainty and
+  assumptions cannot be dropped silently.
+- **Reasons must cite something specific** to that listing — price against the
+  stated budget, condition, a line from the description, seller rating.
+  Enforced in the tool description.
 
-The cost is real. This depends on an interface with no compatibility promise,
-and Mercari can break it without notice. A production version should use an
-authorised channel. What we can control is our own behaviour: requests are
-spaced a second apart, and transport failures are sorted into named errors
-(`NetworkError`, `RateLimitError`, `ItemNotFoundError`) rather than retried
-blindly.
+Validation splits by severity:
 
-**Record and replay.** Inventory changes daily, so the same query gives
-different results on different days. In `record` mode every response is saved
-to disk; in `replay` mode nothing touches the network, and a call that was
-never recorded raises rather than quietly falling back. A run that is half
-online and half offline is not reproducible, so failing loudly is the point.
+| Problem | Handling |
+|---|---|
+| Id never returned by any search | Hard. Payload goes back to the model once for repair (`max_validation_retries = 1`) |
+| Listing exceeds the `price_max` the model itself searched with | Soft. Warning shown to the user; no extra turn spent |
 
-#### Stage 3: Assess
+### Retrieval fails in named ways
 
-This is the most important decision in the project.
+**`mercapi`, not HTML scraping.** Mercari publishes no product API for outside
+developers. `mercapi` is a community client for the private API the Mercari
+app itself calls, and handles its request signing. It returns structured JSON:
+no page selectors to break on a redesign, no browser to drive.
 
-While building the data layer I searched for deliberate nonsense — strings
-matching no real product. Mercari does not return zero results. It returns
-listings that look exactly like real matches: same fields, plausible titles,
-nothing marking them as filler. There is no way to tell a failed search from a
-good one by looking at the data.
+The tradeoff is real — no compatibility promise, and Mercari can break it
+without notice. A production system needs an authorised channel. What is
+controllable:
 
-That killed a mechanism that was already written. The original plan was for
-the agent to see an empty result set and decide whether to loosen its
-constraints and try again. That trigger will almost never fire.
+- Requests spaced 1 second apart by a shared throttle.
+- Transport failures translated into a named taxonomy: `RateLimitError`
+  (HTTP 429), `NetworkError` (other wire failures), `ItemNotFoundError`
+  (listing gone).
+- Sold listings filtered in the client rather than exposed as a parameter.
+- `get_item_details` treats partial failure as normal: returns what
+  succeeded, lists the ids that failed, tells the model not to retry them.
 
-So detecting a failed search had to move into the model, as a step with no
-tool of its own. The system prompt works around four problems:
+### A second question works
 
-1. **The evidence is not in the data.** So the prompt replaces "decide whether
-   these results are good" with something mechanical: label every result
-   relevant or not, then count them.
-2. **The model has no sense of how many good results is normal.** So the
-   prompt supplies a number. Fewer than five relevant means the search failed,
-   not that the market is empty.
-3. **Admitting the search failed means contradicting its own earlier work,**
-   which models are reluctant to do. So the prompt states plainly that
-   returning fewer than three listings, or none, is a correct answer.
-4. **A wrong judgement here is invisible to the user.** One bad recommendation
-   is obvious. Three confidently wrong ones are not. So `confidence` is a
-   required field.
+No separate state object. The message history is the state.
 
-The number five in (2) is a guess. Checking it is the single most useful thing
-an evaluation harness could do.
+```
+messages = [user turn]
+repeat:
+    response = LLM(system_prompt, tool_schemas, messages)
+    append the assistant turn verbatim
+    for each tool_use block: execute it, collect a tool_result
+    append all tool_results as one user message
+    stop when a terminal tool succeeds, or the model stops calling tools
+```
 
-#### Stage 4: Enrich
+One user turn in, then exactly two messages per round trip:
 
-**Partial failure is the normal case, not an exception.** Listings sell out
-constantly, so by the time we fetch details for five ids, one or two may be
-gone. Failing the whole call would throw away good data. Dropping the missing
-ones silently would leave the model believing it saw details it never got. So
-the tool returns what succeeded, lists what failed, and tells the model not to
-retry those ids.
+```
+user       "美品のギターを30000円以下で"
+assistant  [ text, tool_use search_mercari ]
+user       [ tool_result: 30 listings, 3 searches left ]
+assistant  [ text, tool_use get_item_details ]
+user       [ tool_result: 4 details, 0 failures ]
+assistant  [ tool_use present_recommendations ]
+user       [ tool_result: delivered ]
+```
 
-#### Stage 5: Rank and justify
+Two things bite only on the second question:
 
-**Every reason has to point at something specific in that listing** — the
-price against the stated budget, the condition, a line from the seller's
-description, the seller's rating. "Good quality, great value" could be written
-about anything, so the tool description rules it out.
+- **The assistant turn is appended verbatim, text blocks included.** The
+  relevance assessment described above lives in those blocks. Filtering down
+  to tool
+  calls discards it.
+- **Every `tool_use` needs a matching `tool_result`, closing tools included.**
+  An unanswered block makes the API reject the history on the *next* turn — a
+  400 far from its cause. The loop answers every block before deciding to stop.
 
-**Returning fewer than three listings is a correct outcome,** and both the
-prompt and the tool description say so. Because Mercari always returns
-something, padding the list to three costs nothing and being honest costs
-work. The prompt has to push against that.
+Three lifetimes are kept separate:
 
-#### Stage 6: Validate
+| Scope | What | Why |
+|---|---|---|
+| Reset each turn | search / detail / repair counters, declared price bounds | A new question deserves a full allowance; a stale bound warns about a constraint the user never set |
+| Kept | listings retrieved so far | Follow-ups refer back to them, and they are what catches invented ids |
+| Kept | clarification allowance | The tool promises one question per conversation |
 
-Two kinds of problem, handled differently.
+`smoke_test_client.py` has a regression test for the per-turn reset and for
+the retained listings.
 
-**Hard problems get one repair attempt.** An id that never appeared in a
-search result means the recommendation describes a listing that does not
-exist. The model gets the payload back once, with an explanation and a chance
-to fix it.
+### Cost is bounded even when the model misbehaves
 
-**Soft problems become warnings.** If a recommended listing costs more than
-the `price_max` the model itself searched with, the user should see that, but
-it is not worth spending another turn on. It says something about the model's
-internal consistency rather than making the answer wrong.
+A tool schema is not a contract: the API does not reject a call that violates
+its own schema. Limits are enforced in three places.
 
-### Budgets, which cut across every stage
+| Layer | Where | Binding? |
+|---|---|---|
+| Tool schema | `build_tool_schemas` | No — guidance only |
+| Executor counters | `ToolExecutor` | Yes, per tool |
+| Turn cap | the loop in `agent.py` | Yes, overall |
 
-**The tool schema is not a contract.** `maxItems` and parameter descriptions
-guide the model, but the API does not reject a tool call that breaks its own
-schema. So the limits are applied again in the executor, where they actually
-bind, and `max_turns` in the loop catches anything the per-tool counters miss.
+Per-tool counters matter beyond limiting totals: without them the model could
+spend every turn searching and never fetch a detail, leaving the turn cap to
+end a run that never looked at a product. Defaults are 4 searches, 2 detail
+calls of at most 5 ids each, and 8 turns.
 
-**Budgets reset every turn, not every conversation.** This started as a bug.
-The counters lived on the executor, which lives as long as the agent, so by
-the fourth question in a session every search was refused and the agent could
-only apologise. Fixing it meant separating three lifetimes:
+Every error carries a next step. An error that only states the problem invites
+retrying it until the budget is gone, so "search budget exhausted" also says
+to proceed to `present_recommendations` and lower confidence. Three
+consecutive tool failures end the run.
 
-- **Reset each turn:** search, detail and repair counters, and the price
-  bounds the model declared. A second question deserves a full allowance, and
-  a price limit left over from an earlier, unrelated question would otherwise
-  produce warnings about a constraint the user never set.
-- **Kept:** the listings retrieved so far, because follow-ups refer back to
-  them ("the second one, but cheaper"), and because they are what catches
-  made-up ids.
-- **Kept:** the clarification allowance, because the tool promises one
-  question per conversation. Resetting it each turn would let the agent keep
-  interrogating the user.
+### Runs can be reproduced, and attributed to a stage
 
-`smoke_test_client.py` has a regression test for this.
+Mercari's inventory is alive, so the same query differs day to day for reasons
+unrelated to the agent.
 
-**Every error tells the model what to do next.** An error that only states the
-problem invites the model to retry the same call until the turn budget is
-gone. So each one carries an instruction: search budget exhausted means go to
-`present_recommendations` with what you already have and lower your
-confidence.
+- `--mode record` saves every response; `--mode replay` serves only from those
+  files and raises on a miss rather than falling back. A run that is half
+  online and half offline is not reproducible.
+- Freezing the data does not freeze the model. The same sentence can produce
+  slightly different parameters, changing the cassette key and missing. The
+  agent runs at `temperature = 0`.
+- The cassette key excludes client-side-only parameters such as `limit`, so
+  one recording serves every context-size setting.
+
+Attribution rests on the model/code split: the model interprets, assesses and
+ranks; the code retrieves, enriches, validates and renders, and returns the
+same thing every time for the same arguments. Anything that differs between
+two runs of one query is the model.
+
+Every run appends typed events to `traces/YYYY-MM-DD.jsonl` keyed by run id:
+LLM calls with token counts and latency, tool calls with arguments and an
+error flag, data-layer calls with cache state.
+
+This is infrastructure, not measurement. See
+[Potential Improvements](#potential-improvements) for what I would measure
+with it.
 
 ---
 
 ## Potential Improvements
 
-**An evaluation harness, staged like the pipeline.** The groundwork is in
-place — record/replay freezes stage 2, structured outputs make stage 5
-checkable mechanically, and every run emits typed events. Three things worth
-measuring, in descending order of value: whether the agent pads to three
-listings when fewer genuinely fit, measured on deliberately obscure queries
-(stage 3); whether stated reasons are faithful to the retrieved records, which
-is checkable directly rather than by a judge (stage 5); and whether the "fewer
-than five relevant" threshold is the right number (stage 3 again).
+**An evaluation harness, staged like the pipeline.** Nothing here has been
+run. The groundwork exists — record/replay freezes the data, `temperature = 0`
+removes most sampling drift, the terminal tools return machine-checkable
+objects, and typed traces attribute every call to a stage. Stage isolation is
+the point: a wrong keyword at stage 1 guarantees a bad ranking at stage 5, so
+scoring stage 5 on that run measures nothing about ranking.
 
-**Preference memory across turns.** The multi-turn transport already exists;
-what is missing is carrying stated preferences forward, so "actually, cheaper"
-does not require restating the original request.
+| Stage | What to measure | Method |
+|---|---|---|
+| 1 Interpret | Are price, condition and keyword extracted correctly? | Fixed request set with hand-written expected parameters, spanning Japanese, English, misspelled English and multi-constraint requests. Exact match on `price_*` and `condition_at_least`; substring match on `keyword` against a list of acceptable Japanese terms — equality produces false failures on spacing and on synonyms that retrieve equally well (`デニム` / `ジーンズ`) |
+| 2 Retrieve | Is `--limit 30` a recall ceiling? | Sweep the limit against recorded cassettes and check whether the eventually-chosen listing ever sits beyond position 30. If it does, every downstream metric is measuring the wrong candidate pool |
+| 3 Assess | Does it pad to three when few listings genuinely fit? | Requests for things Mercari has little of, replayed from cassettes. Report the fraction of runs returning three anyway, and whether `confidence` drops when the pool is thin. Sweeping the threshold of 5 against the same set replaces that guess with a number |
+| 4 Enrich | — | Deterministic. Per-id failures are already reported in the tool result |
+| 5 Rank | Does the order follow the criteria the prompt states? | The prompt is the specification, so no external label set is needed. Two checks: a weighted utility score computed from the retrieved records, compared against the agent's ordering; and a differential test — hold the cassette fixed, change only the stated priority ("cheapest" versus "best condition"), and assert the order changes. A ranking that does not move is not ranking |
+| 6 Validate | — | Deterministic |
 
-**Listing images.** Mercari is a photo-driven marketplace, and condition
-claims in text are frequently contradicted by the photographs. Scoring images
-against the seller's description at stage 4 would catch a class of bad listing
-that text alone cannot.
+Stages 3 and 5 both rest on judging relevance, so a single mislabelled query
+set would move both numbers in the same direction.
 
-**Sold-listing comparison.** The client filters to on-sale items only. Sold
-listings are the natural reference for "is this actually a good price?", which
-is the question every shopper is really asking.
+**Trim the conversation history.** Every turn resends the entire history,
+including the full 30-listing payload from every earlier search. Nothing is
+summarised or dropped, so by the fourth question the request carries three
+stale result sets the model will never look at again. Extracting the user's
+stated preferences into a small structured record, and discarding the raw
+listings behind it, would cut input tokens and give follow-up turns something
+steadier to read than the whole transcript.
 
-**Parallel detail fetching.** Stage 4 is sequential behind a shared throttle.
-Bounded concurrency with a token-bucket limiter would cut the slowest part of
-a turn without becoming a worse-behaved client.
-
-**Category and brand filters.** Mercari's API exposes category and brand ids.
-Exposing them would let stage 1 narrow structurally rather than by keyword
-alone — at the cost of shipping an id mapping, which is why keywords came
-first.
+**Category and brand filters.** The probe in
+[Design Choices › It can tell you it found nothing](#it-can-tell-you-it-found-nothing)
+found a request for an Hermès Birkin returning an Hermès *bracelet*: the search matched the brand and
+the colourway and ignored the product type entirely. `mercapi` accepts
+`categories`, `brands`, `sizes` and `exclude`, none of which the agent
+currently uses. A category filter would have dropped the bracelet before the
+model ever saw it, and `exclude` would remove `復刻` reproductions at the
+source rather than asking the model to spot them. The cost is a stored id
+mapping, which is why keywords came first.
